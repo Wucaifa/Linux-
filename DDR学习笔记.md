@@ -265,7 +265,9 @@ Hibernate和Sleep两个功能是Linux Generic PM的核心功能，它们的目�
 
 - **/dev/snapshot**
 
+### Platform Driver framework
 
+https://blog.csdn.net/tiantianhaoxinqing__/article/details/125889832
 
 ### PM QOS framework
 
@@ -431,6 +433,347 @@ PM QoS class framework提供的API有两类：
 
    通过sysfs文件，kernel允许用户空间程序对某个设备提出QoS需求，这些sysfs文件位于各个设备的sysf目录下，默认情况下，PM QoS framework不会创建这些文件，需要具体设备驱动调用dev_pm_qos_expose_*系列接口，主动创建。
 
+### Platform QOS
+
+`platform_qos` 是 Linux 内核中针对 **Platform 设备**的 **服务质量（Quality of Service, QoS）** 扩展机制，它结合了 Platform Bus 的设备管理能力和 PM QoS 的性能/功耗约束功能，专门用于管理片上系统（SoC）中 Platform 设备的资源分配和性能保障。
+
+`platform_qos` 是 Platform 设备专用的 **精细化性能管理工具**，它：
+
+- 继承 PM QoS 的核心思想，但针对 Platform 设备特性优化
+- 通过设备树或 sysfs 灵活配置
+- 与 `devfreq`、`cpufreq` 等联动实现端到端的服务质量保障
+- 尤其适合对实时性、带宽敏感的嵌入式场景
+
+#### 数据结构
+
+```c
+struct platform_qos_request {}
+struct platform_qos_flags_request {}
+enum platform_qos_type {}
+enum {//里面定义一些自己需要的服务质量，比如内存延迟、内存吞吐、L1总线延迟等}
+struct platform_qos_constraints {}
+struct platform_qos_flags {}
+enum platform_qos_req_action {}
+struct platform_qos_req_data {}
+```
+
+
+
+#### 函数接口
+
+```c
+int platform_qos_request(int platform_qos_class);
+int platform_qos_request_active(struct platform_qos_request *req);
+s32 platform_qos_read_value(struct platform_qos_constraints *c);
+void platform_qos_add_request(struct platform_qos_request *req,
+			      int platform_qos_class, s32 value);
+void platform_qos_update_request(struct platform_qos_request *req,
+				 s32 new_value);
+void platform_qos_update_request_timeout(struct platform_qos_request *req,
+					 s32 new_value,
+					 unsigned long timeout_us);
+void platform_qos_remove_request(struct platform_qos_request *req);
+
+int platform_qos_add_notifier(int platform_qos_class, struct notifier_block *notifier);
+int platform_qos_remove_notifier(int platform_qos_class, struct notifier_block *notifier);
+int platform_qos_debug_record(int platform_qos_class,
+		int *active_nums, struct platform_qos_req_data *data, int data_size);
+```
+
+| **函数原型**                              | **参数说明**                                                 | **返回值**        | **功能描述**                        | **使用场景**                               |
+| :---------------------------------------- | :----------------------------------------------------------- | :---------------- | :---------------------------------- | :----------------------------------------- |
+| **`platform_qos_request`**                | `platform_qos_class`: QoS 类型（如延迟、带宽）               | 当前约束值        | 查询指定 QoS 类型的当前有效值       | 快速检查当前系统约束状态                   |
+| **`platform_qos_request_active`**         | `req`: 要检查的 QoS 请求指针                                 | 1=活跃 / 0=未激活 | 检查请求是否已注册并生效            | 调试或条件操作前验证请求状态               |
+| **`platform_qos_read_value`**             | `c`: QoS 约束结构体指针                                      | 当前目标值        | 直接读取约束结构体的 `target_value` | 底层约束管理逻辑                           |
+| **`platform_qos_add_request`**            | `req`: 请求对象 `platform_qos_class`: QoS 类型 `value`: 初始约束值 | 无                | 注册一个新的 QoS 请求               | 驱动初始化时设置初始约束                   |
+| **`platform_qos_update_request`**         | `req`: 已注册的请求 `new_value`: 新约束值                    | 无                | 更新现有请求的约束值                | 动态调整性能需求（如温度变化时降频）       |
+| **`platform_qos_update_request_timeout`** | `req`: 请求对象 `new_value`: 临时约束值 `timeout_us`: 超时时间（微秒） | 无                | 临时更新约束值，超时后恢复原值      | 保障短时高负载任务（如相机拍照）           |
+| **`platform_qos_remove_request`**         | `req`: 要移除的请求                                          | 无                | 注销 QoS 请求并释放资源             | 驱动卸载或约束不再需要时                   |
+| **`platform_qos_add_notifier`**           | `platform_qos_class`: QoS 类型 `notifier`: 通知块指针        | 0=成功 / 错误码   | 注册约束变化通知回调                | 需要实时响应约束变化的模块（如 DVFS 驱动） |
+| **`platform_qos_remove_notifier`**        | `platform_qos_class`: QoS 类型 `notifier`: 已注册的通知块    | 0=成功 / 错误码   | 移除通知回调                        | 模块卸载时清理资源                         |
+| **` platform_qos_debug_record`**          | `platform_qos_class`: QoS 类型 `active_nums`: 返回活跃请求数 `data`: 请求数据数组 `data_size`: 数组容量 | 实际填充的数据量  | 调试接口，获取当前所有活跃请求详情  | 系统调试或日志分析                         |
+
+### devfreq framework
+
+当今的复杂SoC由多个子模块协同工作组成（CPU，NPU，GPU等）。
+
+**在执行各种用例的操作系统中，并非SoC中的所有模块都需要始终保持最高性能**。
+
+为方便起见，将SoC中的子模块分组为域，从而允许某些域以较低的电压和频率运行，而其他域以较高的电压/频率对运行。
+
+对于**这些设备支持的频率和电压对**，我们称之为**OPP**（Operating Performance Point）。
+
+对于具有OPP功能的**非CPU设备**，本文称之为OPP device，需要通过devfreq进行动态的调频调压。
+
+- cpufreq驱动并不允许多个设备来注册，而且也不适合不同的设备具有不同的governor。
+- devfreq则支持多个设备，并且允许每个设备有自己对应的governor。
+
+```mermaid
+flowchart TD
+    classDef framework fill:#ffe699,stroke:#333,stroke-width:2px
+    classDef governor fill:#f99b7d,stroke:#333,stroke-width:2px
+    classDef device fill:#73c2fb,stroke:#333,stroke-width:2px
+    classDef opp fill:#ffd56b,stroke:#333,stroke-width:2px
+    classDef dts fill:#b2ebf2,stroke:#333,stroke-width:2px
+
+    %% ========== 顶层：Devfreq框架 ==========
+    subgraph F["Devfreq Framework"]
+        direction LR
+        GovList["Governor List<br/>(gov0 → gov1 → ...)"]:::framework
+        DevList["Device List<br/>(df0 → df1 → ...)"]:::framework
+    end
+
+    %% ========== 中层：并列模块 ==========
+    subgraph Middle[" "]
+        direction LR
+        
+        subgraph G["Governor Module"]
+            direction TB
+            GovDef["Governor Structure:<br/>• name<br/>• get_target_freq<br/>• event_handler"]:::governor
+            GovAdd["add_governor()"]:::governor
+            GovDef -->|定义| GovAdd
+        end
+
+        subgraph D["Device Module"]
+            direction TB
+            DevDef["Device Profile:<br/>• target<br/>• get_cur_freq"]:::device
+            DevAdd["add_device()"]:::device
+            DevDef -->|定义| DevAdd
+        end
+    end
+
+    %% ========== 底层：OPP管理 ==========
+    subgraph Bottom[" "]
+        direction LR
+        OPP["OPP Table"]:::opp
+        DTS["Device Tree<br/>(DTS)"]:::dts
+        DTS -->|配置| OPP
+    end
+
+    %% ========== 主要连接 ==========
+    GovAdd -->|注册到| GovList
+    DevAdd -->|注册到| DevList
+    DevDef -->|关联| OPP
+
+    %% ========== 美化布局 ==========
+    style F stroke:#f90,stroke-width:3px,rx:8,ry:8
+    style G stroke:#f55,stroke-width:3px,rx:8,ry:8
+    style D stroke:#59f,stroke-width:3px,rx:8,ry:8
+    style Bottom fill:none,stroke:none
+    
+    linkStyle 0 stroke:#f55,stroke-width:2px
+    linkStyle 1 stroke:#59f,stroke-width:2px
+    linkStyle 2 stroke:#fc0,stroke-width:2px
+    
+    %% 添加圆角效果
+    class GovList,DevList,GovDef,GovAdd,DevDef,DevAdd,OPP,DTS rx:5,ry:5
+```
+
+
+
+```mermaid
+flowchart TB
+    %% ================= Sysfs 用户接口 =================
+    subgraph sysfs["Sysfs 用户接口"]
+        A["/sys/class/devfreq/xxx_device"] -->|读写频率/电压| B["current_freq\navailable_frequencies"]
+        A -->|选择调控策略| C["available_governors\ngovernor"]
+        A -->|统计信息| D["load\ntrans_stat"]
+    end
+
+    %% ================= Devfreq 核心层 =================
+    subgraph devfreq["Devfreq 核心层"]
+        C --> E["Governor 策略"]
+        E -->|simple_ondemand| F["基于负载动态调频"]
+        E -->|userspace| G["用户手动设置"]
+        E -->|performance| H["锁定最高频率"]
+
+        F & G & H --> I["devfreq_core"]
+        I --> J["注册/注销设备\n(devfreq_add/remove_device)"]
+        J --> K["devfreq_driver"]
+    end
+
+    %% ================= OPP 硬件控制层 =================
+    subgraph opp["OPP 硬件控制层"]
+        K --> L["OPP 表查询\n(频率-电压组合)"]
+        L -->|clk_set_rate| M["Clock Driver"]
+        L -->|regulator_set_voltage| N["Regulator Driver"]
+        M & N --> O["PMIC/时钟电路"]
+    end
+
+    %% ================= 样式设置 =================
+    style sysfs fill:#e1f5fe,stroke:#039be5
+    style devfreq fill:#e8f5e9,stroke:#43a047
+    style opp fill:#fff3e0,stroke:#fb8c00
+```
+
+#### 工作流程
+
+1. **初始化**：设备驱动创建 devfreq 实例，设置 profile 和初始 governor
+2. **监控**：通过工作队列定期调用 governor 的 get_target_freq
+3. **决策**：Governor 根据设备状态(last_status)计算目标频率
+4. **限制检查**：考虑 scaling_min/max_freq 和 PM QoS 限制
+5. **频率切换**：通过 profile->target 实际设置设备频率
+6. **通知**：通过 notifier_list 通知相关组件频率变化
+
+#### 核心数据结构
+
+##### 1. **`devfreq_dev_profile` 结构体**
+
+```c
+struct devfreq_dev_profile {
+    unsigned long initial_freq;
+    unsigned int polling_ms;
+    enum devfreq_timer timer;
+    int (*target)(struct device *dev, unsigned long *freq, u32 flags);
+    int (*get_dev_status)(struct device *dev,
+                  struct devfreq_dev_status *stat);
+    int (*get_cur_freq)(struct device *dev, unsigned long *freq);
+    void (*exit)(struct device *dev);
+    void (*update_polling_ms)(struct devfreq *df);
+    unsigned long *freq_table;
+    unsigned int max_state;
+};
+```
+
+| 成员           | 类型                 | 说明                           |
+| :------------- | :------------------- | :----------------------------- |
+| `initial_freq` | `unsigned long`      | 设备启动时的初始频率值         |
+| `polling_ms`   | `unsigned int`       | 状态轮询间隔（毫秒）           |
+| `timer`        | `enum devfreq_timer` | 使用的定时器类型枚举           |
+| `freq_table`   | `unsigned long *`    | 可选频率表（支持的频率列表）   |
+| `max_state`    | `unsigned int`       | 频率表的最大状态数（频率项数） |
+
+| 回调函数           | 参数                                                         | 功能             | 返回值               |
+| :----------------- | :----------------------------------------------------------- | :--------------- | :------------------- |
+| `target()`         | `dev`: 目标设备 `freq`: 输入期望频率/输出实际频率 `flags`: 标志位 | 设置目标频率     | `0`=成功 `负值`=错误 |
+| `get_dev_status()` | `dev`: 目标设备 `stat`: 输出设备状态                         | 获取当前设备状态 | `0`=成功 `负值`=错误 |
+| `get_cur_freq()`   | `dev`: 目标设备 `freq`: 输出当前频率                         | 获取当前实际频率 | `0`=成功 `负值`=错误 |
+
+##### 2. `struct devfreq_governor`结构体
+
+```c
+struct devfreq_governor {
+    struct list_head node;
+    const char name[DEVFREQ_NAME_LEN];
+    const unsigned int immutable;
+    const unsigned int interrupt_driven;
+    int (*get_target_freq)(struct devfreq *this, unsigned long *freq);
+    int (*event_handler)(struct devfreq *devfreq,
+                unsigned int event, void *data);
+};
+```
+
+| 成员                   | 类型                                              | 说明                                   | 是否必须赋值 |
+| :--------------------- | :------------------------------------------------ | :------------------------------------- | :----------- |
+| **`node`**             | `struct list_head`                                | 内核链表节点（由内核自动管理）         | ❌ 否         |
+| **`name`**             | `const char[DEVFREQ_NAME_LEN]`                    | 调控策略的唯一标识名称                 | ✔️ 是         |
+| **`immutable`**        | `const unsigned int`                              | 标志位：策略是否不可修改               | ✔️ 是         |
+| **`interrupt_driven`** | `const unsigned int`                              | 标志位：是否由中断驱动（非定时器轮询） | ❌ 可选       |
+| **`get_target_freq`**  | `int (*)(struct devfreq *, unsigned long *)`      | 核心回调：计算目标频率                 | ✔️ 是         |
+| **`event_handler`**    | `int (*)(struct devfreq *, unsigned int, void *)` | 事件处理回调：响应系统事件             |              |
+
+> `event_handler`
+
+| 事件                          | 值   | 触发场景     |
+| :---------------------------- | :--- | :----------- |
+| `DEVFREQ_GOV_START`           | 1    | 调控器启动   |
+| `DEVFREQ_GOV_STOP`            | 2    | 调控器停止   |
+| `DEVFREQ_GOV_UPDATE_INTERVAL` | 3    | 更新轮询间隔 |
+| `DEVFREQ_GOV_SUSPEND`         | 4    | 设备挂起     |
+| `DEVFREQ_GOV_RESUME`          | 5    | 设备恢复     |
+
+##### 3. `struct devfreq`结构体
+
+```c
+struct devfreq {
+    struct list_head node;
+    struct mutex lock;
+    struct device dev;
+    struct devfreq_dev_profile *profile;
+    const struct devfreq_governor *governor;
+    char governor_name[DEVFREQ_NAME_LEN];
+    struct notifier_block nb;
+    struct delayed_work work;
+    unsigned long previous_freq;
+    struct devfreq_dev_status last_status;
+    void *data;
+    struct dev_pm_qos_request user_min_freq_req;
+    struct dev_pm_qos_request user_max_freq_req;
+    unsigned long scaling_min_freq;
+    unsigned long scaling_max_freq;
+    bool stop_polling;
+    unsigned long suspend_freq;
+    unsigned long resume_freq;
+    atomic_t suspend_count;
+    struct devfreq_stats stats;
+    struct srcu_notifier_head transition_notifier_list;
+    struct notifier_block nb_min;
+    struct notifier_block nb_max;
+};
+```
+
+| 成员名                     | 注释说明                                                     |
+| -------------------------- | ------------------------------------------------------------ |
+| `node`                     | 用于将 `devfreq` 实例链接到全局 `devfreq` 列表，实现链表管理 |
+| `lock`                     | 保护 `devfreq` 结构的互斥锁，保障多线程 / 多进程访问时数据一致性 |
+| `dev`                      | 关联的设备结构，用于关联具体硬件设备对象                     |
+| `profile`                  | 指向设备特定频率调节配置的指针，描述设备频率调节相关的参数、策略等 |
+| `governor`                 | 当前使用的频率调节策略（`governor`），决定设备频率动态调节的逻辑 |
+| `governor_name`            | 频率调节策略（`governor`）的名称，以字符串形式存储           |
+| `nb`                       | 用于接收系统通知的 `notifier block`，可响应系统层面的事件通知 |
+| `work`                     | 延迟工作队列，用于定时执行频率调节相关任务，实现异步、延时的频率调整逻辑 |
+| `previous_freq`            | 设备上一次设置的频率，记录历史频率状态                       |
+| `last_status`              | 设备上一次的状态信息，保存设备状态相关数据（如负载、性能等） |
+| `data`                     | 频率调节策略（`governor`）的私有数据指针，供策略内部自定义数据使用 |
+| `user_min_freq_req`        | PM QoS 最小频率请求，用于管理用户侧对设备最低运行频率的需求  |
+| `user_max_freq_req`        | PM QoS 最大频率请求，用于管理用户侧对设备最高运行频率的需求  |
+| `scaling_min_freq`         | 当前允许的最小频率，设备实际运行频率的下限约束               |
+| `scaling_max_freq`         | 当前允许的最大频率，设备实际运行频率的上限约束               |
+| `stop_polling`             | 是否停止轮询的标志，控制频率调节相关轮询操作的启停           |
+| `suspend_freq`             | 挂起时使用的频率，设备进入挂起状态前设置的频率值             |
+| `resume_freq`              | 恢复时使用的频率，设备从挂起状态恢复后初始使用的频率值       |
+| `suspend_count`            | 挂起计数，统计设备进入挂起状态的次数等情况                   |
+| `stats`                    | 设备频率转换统计信息，记录频率切换次数、耗时等统计数据       |
+| `transition_notifier_list` | 频率转换通知链，用于在设备频率转换时，向注册的通知者发送事件通知 |
+| `nb_min`                   | 最小频率变化的通知块，响应设备最小允许频率发生改变的事件     |
+| `nb_max`                   | 最大频率变化的通知块，响应设备最大允许频率发生改变的事件     |
+
+#### 核心函数接口
+
+##### 1. governor相关
+
+```c
+int devfreq_add_governor(struct devfreq_governor *governor);
+int devfreq_remove_governor(struct devfreq_governor *governor);
+int devfreq_update_status(struct devfreq *devfreq, unsigned long freq);
+int update_devfreq(struct devfreq *devfreq);
+
+extern void devfreq_monitor_start(struct devfreq *devfreq);
+extern void devfreq_monitor_stop(struct devfreq *devfreq);
+extern void devfreq_monitor_suspend(struct devfreq *devfreq);
+extern void devfreq_monitor_resume(struct devfreq *devfreq);
+```
+
+| **函数原型**                  | **参数**                               | **返回值**                                              | **功能描述**                            |
+| :---------------------------- | :------------------------------------- | :------------------------------------------------------ | :-------------------------------------- |
+| **`devfreq_add_governor`**    | `governor`: 指向要注册的调控策略结构体 | `0`: 成功 `-EEXIST`: 同名策略已存在 `-EINVAL`: 无效参数 | 向 devfreq 框架注册一个新的频率调控策略 |
+| **`update_devfreq;`**         | `devfreq`: 目标设备实例                | `0`: 成功 `负值`: 错误代码                              | 立即触发一次频率更新（绕过定时器）      |
+| **`devfreq_monitor_start`**   | `devfreq`: 目标设备实例                | 无                                                      | 启动设备的监控定时器                    |
+| **`devfreq_monitor_stop`**    | `devfreq`: 目标设备实例                | 无                                                      | 停止设备的监控定时器                    |
+| **`devfreq_monitor_suspend`** | `devfreq`: 目标设备实例                | 无                                                      | 暂停监控（保持状态）                    |
+| **`devfreq_monitor_resume`**  | `devfreq`: 目标设备实例                | 无                                                      | 恢复暂停的监控                          |
+
+##### 2. devfreq相关
+
+
+
+
+
+#### 参考文献
+
+1. [Linux devfreq framework 剖析 - 内核工匠 - 博客园 (cnblogs.com)](https://www.cnblogs.com/Linux-tech/p/12961282.html)
+2. https://blog.csdn.net/qq_45698138/article/details/141964232?spm=1001.2101.3001.6650.13&utm_medium=distribute.pc_relevant.none-task-blog-2%7Edefault%7EBlogCommendFromBaidu%7ERate-13-141964232-blog-104260671.235%5Ev43%5Epc_blog_bottom_relevance_base5&depth_1-utm_source=distribute.pc_relevant.none-task-blog-2%7Edefault%7EBlogCommendFromBaidu%7ERate-13-141964232-blog-104260671.235%5Ev43%5Epc_blog_bottom_relevance_base5&utm_relevant_index=16 devfreq 内核框架介绍
+
 ### 补充点
 
 #### ACPI
@@ -467,3 +810,97 @@ ACPI（Advanced Configuration and Power Interface，高级配置与电源接口�
 - 用 **AML（ACPI Machine Language）** 编写的逻辑，由操作系统在运行时解释执行。例如：
   - `_PS0`：打开设备电源。
   - `_PRW`：定义设备唤醒能力。
+
+#### SOC电源域和时钟域的划分
+
+现代手机SoC（如高通骁龙、联发科天玑、苹果A系列）通常采用**多层级的域划分策略**，以实现动态电压频率调整（DVFS）、电源门控（Power Gating）和时钟门控（Clock Gating）等节能技术。
+
+> 手机SoC通常划分为以下几个关键域：
+
+1. **Always-On（常开域）**
+   - **功能**：负责系统的基础运行，即使手机处于休眠状态（如锁屏）仍需工作。
+   - **包含模块**：电源管理单元（PMIC接口）、实时时钟（RPC, RTC）、唤醒控制器（Wake-up Controller）、部分传感器（如加速度计、光线传感器）
+   - **供电特点**：极低电压（0.6V~0.8V）、超低频率（32kHz~几MHz）、通常不支持完全断电（否则无法响应按键/传感器唤醒）
+2. **应用处理器（AP Domain）**
+   - **功能**：运行操作系统（Android/iOS）和用户应用，是SoC的核心计算部分。
+   - **典型子域划分**：
+     - **大核（Performance CPU Cluster）**
+       - 如Cortex-X系列（ARM）或Firestorm（苹果）
+       - 高电压（0.9V~1.2V），高频（3GHz+）
+     - **小核（Efficiency CPU Cluster）**
+       - 如Cortex-A5xx/A7xx（ARM）或Icestorm（苹果）
+       - 低电压（0.7V~0.9V），低频（1GHz~2GHz）
+     - **共享缓存（LLC, Last-Level Cache）**
+       - 可能独立供电以支持动态调整
+3. **GPU域（Graphics Domain）**
+   - **功能**：处理图形渲染、游戏、UI动画等任务。
+   - **供电特点**：支持DVFS（动态调频调压）、典型电压范围：0.8V~1.1V、频率范围：300MHz~1GHz+（如Adreno GPU）
+   - **优化策略**：低负载时降频（如浏览网页）、高负载时升压（如游戏）
+4. **神经网络处理单元（NPU/AI Domain）**
+   - **功能**：加速AI计算（如人脸识别、语音助手、相机HDR）。
+   - **供电特点**：通常独立供电，支持突发高性能计算；电压范围：0.8V~1.0V；可动态开关（部分任务完成后断电）
+5. **影像处理单元（ISP Domain）**
+   - **功能**：处理摄像头数据（如多帧合成、降噪、HDR）。
+   - **供电特点**：
+     - 按需供电（拍照/录像时激活）
+     - 电压通常0.9V~1.0V
+     - 可能进一步划分：
+       - **前端ISP**（低功耗，负责基础处理）
+       - **后端ISP**（高性能，负责AI增强）
+6. **基带处理器（Modem Domain）**
+   - **功能**：负责蜂窝通信（5G/4G/Wi-Fi/蓝牙）。
+   - **供电特点**：
+     - 分多个子域：
+       - **RF前端**（高电压，高频）
+       - **基带DSP**（中等功耗）
+       - **待机模块**（低功耗，监听网络信号）
+     - 5G Modem通常比4G更耗电，需精细调控
+7. **内存控制器（Memory Domain）**
+   - **功能**：管理DRAM（LPDDR5/LPDDR5X）访问。
+   - **供电特点**：
+     - 电压较高（1.05V~1.2V）
+     - 支持动态调整（如DDR频率从800MHz升至3.2GHz）
+8. **外设域（Peripheral Domain）**
+   - **功能**：管理USB、显示屏、存储（UFS）、音频等。
+   - **供电特点**：
+     - 部分外设可完全断电（如NFC不用时关闭）
+     - 部分需低功耗运行（如蓝牙LE）
+
+#### SOC架构
+
+| **子模块**                | **功能**                 | **协同工作场景**                    | **电源/时钟管理**                |
+| :------------------------ | :----------------------- | :---------------------------------- | :------------------------------- |
+| **CPU集群**               | 应用运算（大核+小核）    | 游戏时大核满频，小核处理后台任务    | DVFS动态调压（0.7V~1.2V）        |
+| **GPU**                   | 图形渲染                 | 游戏/AR时与CPU共享渲染负载          | 独立电压域，按帧率调整频率       |
+| **NPU**                   | AI加速（图像识别、语音） | 拍照时与ISP协同进行场景识别         | 突发式供电，任务完成后断电       |
+| **ISP**                   | 图像信号处理             | 多摄像头数据合成HDR照片             | 拍照时激活，待机时关闭           |
+| **5G Modem**              | 蜂窝通信                 | 下载数据时与内存控制器交互          | 分时供电（RF前端高功耗按需启动） |
+| **DDR内存控制器**         | 管理LPDDR5X内存访问      | 为CPU/GPU提供低延迟数据             | 随CPU频率动态调整带宽            |
+| **显示引擎**              | 驱动屏幕（120Hz LTPO）   | 根据内容动态调整刷新率（1Hz~120Hz） | 与GPU共享部分计算资源            |
+| **存储控制器（UFS 4.0）** | 高速存储读写             | 应用加载时与CPU直接通信（DMA）      | 空闲时进入低功耗模式             |
+| **电源管理IC（PMIC）**    | 多电压轨调节             | 实时监控各域功耗并调整供电策略      | 全局协调，支持快速唤醒           |
+
+> **协同工作的关键技术**
+
+**(1) 跨域通信**
+
+- **片上网络（NoC）**：
+  类似“数据高速公路”，优先级调度CPU/GPU/NPU间的通信（如ARM AMBA ACE协议）。
+- **共享缓存一致性**：
+  CPU/GPU/NPU通过**一致性总线（如CCIX）**共享数据，避免重复搬运。
+
+**(2) 功耗与性能平衡**
+
+- **异构调度器**：
+  安卓/Linux内核的**EAS调度器**动态分配任务给大核/小核/NPU。
+- **温度反馈控制**：
+  传感器实时监测热点，触发**动态热管理（DTP）**降频或关闭模块。
+
+**(3) 实时性保障**
+
+- **中断优先级**：
+  触摸屏/Modem数据等低延迟请求通过**快速中断（FIQs）**抢占CPU资源。
+- **硬件加速器直连**：
+  如摄像头数据通过**专用DMA通道**直达ISP，不经过CPU。
+
+  
