@@ -1565,4 +1565,425 @@ MODULE_DESCRIPTION("Module func");   // 模块描述
 MODULE_VERSION("1.0.0");            // 版本号
 ```
 
+### 19.initcall机制
+
+> 由来
+
+我们都知道，linux对驱动程序提供静态编译进内核和动态加载两种方式，当我们试图将一个驱动程序编译进内核时，开发者通常提供一个xxx_init()函数接口以启动这个驱动程序同时提供某些服务。
+
+那么，**根据常识来说，这个xxx_init()函数肯定是要在系统启动的某个时候被调用，才能启动这个驱动程序**。
+
+最简单直观地做法就是：开发者试图添加一个驱动初始化程序时，在内核启动init程序的某个地方直接添加调用自己驱动程序的xxx_init()函数，在内核启动时自然会调用到这个程序。
+
+类似这样子：
+
+```c
+void init(void)
+{
+    a_init();
+    b_init();
+    // ...
+    z_init();
+}
+```
+
+但是，回头一想，这种做法在单人开发的小系统中或许可以，但是在linux中，如果驱动程序是这样通过手动添加的话，那就是一场灾难。
+
+不难想到另一种方式，就是集中提供一个地方，如果你要添加你的驱动初始化程序，你就将你的初始化函数在这个地方进行添加，在内核启动的时候统一扫描这个地方，再执行这一部分的所有被添加的驱动程序。
+
+比如，直接在C文件中作一个列表，在里面添加初始化函数：
+
+```c
+#include <stdio.h>
+
+void a_init(void) {
+    printf("%s\n", __func__);
+}
+
+void b_init(void) {
+    printf("%s\n", __func__);
+}
+
+void(*fun_list[]) (void)={
+    a_init,
+    b_init,
+};
+
+void init(void)
+{
+    int i;
+    void(*pfun) (void);
+    for (i = 0; i < sizeof(fun_list)/sizeof(fun_list[0]); ++i) {
+        printf("%d\n", i);
+        fun_list[i]();
+    }
+}
+```
+
+但这个方法也不够完美。
+
+**Linux内核是如何解决的？**
+
+1、Linux源码在编译的时候，通过使用告知编译器链接，自定义一个专门用来存放这些初始化函数的地址段，将对应的函数入口统一放在一起；
+
+2、虽然我们没有手动将函数添加到函数队列中，但实际上我们使用内核提供的`xxx_init()`以后，编译器就可以替我们将对应的函数入口集中存在一个地方。
+
+3、等到在内核启动的时候统一扫描这个段的开始，按照顺序，就可以执行这一部分的所有被添加的驱动程序。
+
+> 对上层而言，linux内核提供xxx_init(init_func)宏定义接口,驱动开发者只需要将驱动程序的init_func使用来修饰，这个函数就被自动添加到了上述的段中，开发者完全不需要关心实现细节。
+
+对于各种各样的驱动而言，可能存在一定的依赖关系，需要遵循先后顺序来进行初始化，考虑到这个，linux也对这一部分做了分级处理。
+
+> initcall与分级
+
+定位到Linux内核源码中的 `include/linux/init.h`，可以看到有如下代码：
+
+```c
+#ifndef MODULE
+// 静态加载
+// ...
+#else 
+// 动态加载
+// ...
+#endif
+```
+
+显然，`MODULE`是可配置的。上面部分用于将模块静态编译连接进内核，下面部分用于编译可动态加载的模块。
+
+接下来我们对这两种情况进行分析。
+
+结论：
+
+- 静态加载时，将不同的`xx_initcall`放在不同的代码段中，Linux内核在执行的时候，根据次序，遍历并执行对应的函数。
+- 动态加载通过系统调用
+
+> 静态加载，`#ifndef MODULE`
+
+```c
+// include/linux/init.h
+/*
+ * Early initcalls run before initializing SMP.
+ *
+ * Only for built-in code, not modules.
+ */
+#define early_initcall(fn)      __define_initcall(fn, early)
+
+/*
+ * A "pure" initcall has no dependencies on anything else, and purely
+ * initializes variables that couldn't be statically initialized.
+ *
+ * This only exists for built-in code, not for modules.
+ * Keep main.c:initcall_level_names[] in sync.
+ */
+#define pure_initcall(fn)       __define_initcall(fn, 0)
+
+#define core_initcall(fn)       __define_initcall(fn, 1)
+#define core_initcall_sync(fn)      __define_initcall(fn, 1s)
+#define postcore_initcall(fn)       __define_initcall(fn, 2)
+#define postcore_initcall_sync(fn)  __define_initcall(fn, 2s)
+#define arch_initcall(fn)       __define_initcall(fn, 3)
+#define arch_initcall_sync(fn)      __define_initcall(fn, 3s)
+#define subsys_initcall(fn)     __define_initcall(fn, 4)
+#define subsys_initcall_sync(fn)    __define_initcall(fn, 4s)
+#define fs_initcall(fn)         __define_initcall(fn, 5)
+#define fs_initcall_sync(fn)        __define_initcall(fn, 5s)
+#define rootfs_initcall(fn)     __define_initcall(fn, rootfs)
+#define device_initcall(fn)     __define_initcall(fn, 6)
+#define device_initcall_sync(fn)    __define_initcall(fn, 6s)
+#define late_initcall(fn)       __define_initcall(fn, 7)
+#define late_initcall_sync(fn)      __define_initcall(fn, 7s)
+
+/**
+ * module_init() - driver initialization entry point
+ * @x: function to be run at kernel boot time or module insertion
+ *
+ * module_init() will either be called during do_initcalls() (if
+ * builtin) or at module insertion time (if a module).  There can only
+ * be one per module.
+ */
+#define module_init(x)  __initcall(x);
+```
+
+`xxx_init_call(fn)`的原型其实是`__define_initcall(fn, n)`。
+
+- n是一个数字或者是数字+s，这个数字代表这个fn执行的优先级，数字越小，优先级越高
+- 带s的fn优先级低于不带s的fn优先级。
+
+```c
+#define module_init(x)  __initcall(x);
+
+#define __initcall(fn) device_initcall(fn)
+
+#define device_initcall(fn)     __define_initcall(fn, 6)
+```
+
+- 需要注意的是，根据官方注释可以看到early_initcall(fn)只针对内置的核心代码，不能描述模块。
+
+1. `__define_initcall`
+
+   ```c
+   #define ____define_initcall(fn, __unused, __name, __sec)	\
+   	static initcall_t __name __used 			\
+   		__attribute__((__section__(__sec))) = fn;
+   #endif
+   
+   #define __unique_initcall(fn, id, __sec, __iid)			\
+   	____define_initcall(fn,					\
+   		__initcall_stub(fn, __iid, id),			\
+   		__initcall_name(initcall, __iid, id),		\
+   		__initcall_section(__sec, __iid))
+   
+   #define ___define_initcall(fn, id, __sec)			\
+   	__unique_initcall(fn, id, __sec, __initcall_id(fn))
+   
+   #define __define_initcall(fn, id) ___define_initcall(fn, id, .initcall##id)
+   ```
+
+   ```c
+   // 展开过程
+   __define_initcall(foo_init, 3)
+   → ___define_initcall(foo_init, 3, .initcall3)
+   → __unique_initcall(foo_init, 3, .initcall3, __initcall_id(foo_init))
+   → ____define_initcall(foo_init, stub, name, .initcall3.init)
+   
+   // 最终生成（伪代码）
+   static initcall_t __initcall_foo_init3 __used 
+   __attribute__((section(".initcall3.init"))) = foo_init;
+   ```
+
+2. 那么存放于`.initcall6.init` 段中的`__initcall_hello_init6`是怎么样被调用的呢？我们看文件 `init/main.c`，代码梳理如下：
+
+   ```rust
+   start_kernel
+   |
+   --> rest_init
+       |
+       --> kernel_thread
+           |
+           --> kernel_init
+               |
+               --> kernel_init_freeable
+                   |
+                   --> do_basic_setup
+                       |
+                       --> do_initcalls
+                           |
+                           --> do_initcall_level(level)
+                               |
+                               --> do_one_initcall(initcall_t fn)
+   ```
+
+   kernel_init 这个函数是作为一个内核线程被调用的（该线程最后会启动第一个用户进程init）。
+   我们着重关注 `do_initcalls` 函数，如下：
+
+   ```c
+   static void __init do_initcalls(void)
+   {
+       int level;
+    
+       for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+           do_initcall_level(level);
+   }
+   ```
+
+   函数 do_initcall_level 如下：
+
+   ```c
+   static void __init do_initcall_level(int level)
+   {
+       // 省略
+       for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+           do_one_initcall(*fn);
+   }
+   ```
+
+   initcall_levels 的定义如下：
+
+   ```c
+   static initcall_entry_t *initcall_levels[] __initdata = {
+   	__initcall0_start,
+   	__initcall1_start,
+   	__initcall2_start,
+   	__initcall3_start,
+   	__initcall4_start,
+   	__initcall5_start,
+   	__initcall6_start,
+   	__initcall7_start,
+   	__initcall_end,
+   };
+   ```
+
+   `initcall_levels[]`中的成员来自于 INIT_CALLS 的展开，如“`__initcall0_start = .;`”，这里的`__initcall0_start`是一个变量，它跟代码里面定义的变量的作用是一样的，所以代码里面能够使用`__initcall0_start`。
+
+   因此在 `init/main.c`中可以通过 extern 的方法将这些变量引入，如下：
+
+   ```cpp
+   extern initcall_t __initcall_start[];
+   extern initcall_t __initcall0_start[];
+   extern initcall_t __initcall1_start[];
+   extern initcall_t __initcall2_start[];
+   extern initcall_t __initcall3_start[];
+   extern initcall_t __initcall4_start[];
+   extern initcall_t __initcall5_start[];
+   extern initcall_t __initcall6_start[];
+   extern initcall_t __initcall7_start[];
+   extern initcall_t __initcall_end[];
+   ```
+
+   到这里基本上就明白了，在 `do_initcalls` 函数中会遍历 `initcalls` 段中的每一个`函数指针`，然后执行这个函数指针。因为编译器根据链接脚本的要求将各个函数指针链接到了指定的位置，所以可以放心地用`do_one_initcall(*fn)`来执行相关初始化函数。
+
+3. 举例：假设我是一个驱动开发者，开发一个名为beagle的驱动，在系统启动时需要调用beagle_init()函数来启动启动服务。
+
+   ```c
+   core_initcall(beagle_init)
+   ```
+
+   `core_initcall(beagle_init)`宏展开为`__define_initcall(beagle_init, 1)`，所以`beagle_init()`这个函数被放置在"`.initcall1.init`"段处。
+
+   在内核启动时，系统会调用到do_initcall()函数。
+
+   根据指针数组`initcall_levels[1]`找到`__initcall1_start`指针，在`vmlinux.lds.h`可以查到：`__initcall1_start`对应"`.initcall1.init`"段的起始地址，依次取出段中的每个函数指针，并执行函数。
+
+   添加的服务就实现了启动。
+
+> 动态加载
+
+一旦可动态加载的模块目标代码（.ko）被加载重定位到内核，其作用域和静态链接的代码是完全等价的。所以这种运行方式的优点显而易见：
+
+1. 可根据系统需要运行动态加载模块，以扩充内核功能，不需要时将其卸载，以释放内存空间；
+2. 当需要修改内核功能时，只需编译相应模块，而不必重新编译整个内核。
+
+因为这样的优点，在进行设备驱动开发时，基本上都是将其编译成可动态加载的模块。但是需要注意，有些模块必须要编译到内核，随内核一起运行，从不卸载，如 vfs、platform_bus等。
+
+实际上，上述的机制就是通过`module_init`实现的。
+
+```c
+// filename: HelloWorld.c
+
+#include <linux/module.h>
+#include <linux/init.h>
+
+static int hello_init(void)
+{
+    printk(KERN_ALERT "Hello World\n");
+    return 0;
+}
+
+static void hello_exit(void)
+{
+    printk(KERN_ALERT "Bye Bye World\n");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+MODULE_LICENSE("Dual BSD/GPL");
+```
+
+上述例子编译可动态加载模块过程中，会自动产生 `HelloWorld.mod.c`文件，内容如下：
+
+```c
+#include <linux/module.h>
+#include <linux/vermagic.h>
+#include <linux/compiler.h>
+ 
+MODULE_INFO(vermagic, VERMAGIC_STRING);
+ 
+struct module __this_module
+__attribute__((section(".gnu.linkonce.this_module"))) = {
+    .name = KBUILD_MODNAME,
+    .init = init_module,
+#ifdef CONFIG_MODULE_UNLOAD
+    .exit = cleanup_module,
+#endif
+    .arch = MODULE_ARCH_INIT,
+};
+ 
+static const char __module_depends[]
+__used
+__attribute__((section(".modinfo"))) =
+"depends=";
+```
+
+可知，其定义了一个类型为 module 的全局变量 `__this_module`，成员 `init` 为 init_module（即 hello_init），且该变量链接到 `.gnu.linkonce.this_module` 段中。
+
+而 init_module 定义如下：
+
+```c
+// modutils/modutils.c
+#define init_module(mod, len, opts) syscall(__NR_init_module, mod, len, opts)
+```
+
+因此，该系统调用对应内核层的 `sys_init_module` 函数。
+
+```c
+SYSCALL_DEFINE3(init_module, ...)
+  load_module
+    do_init_module(mod)
+      do_one_initcall(mod->init);
+```
+
+### 20.probe函数
+
+probe函数在设备驱动注册最后收尾工作，当设备的device 和其对应的driver 在总线上完成配对之后，系统就调用 [platform](https://link.zhihu.com/?target=http%3A//www.ebhou.com/catalog.asp%3Ftags%3Dplatform)设备的probe函数完成驱动注册最后工作。
+
+
+
+### 21.bus总线
+
+在操作系统（尤其是Linux内核）中，"总线"是一个更抽象的**软件概念**。
+
+| **维度**     | **硬件总线**                | **软件总线（Linux内核）**             |
+| :----------- | :-------------------------- | :------------------------------------ |
+| **物理表现** | PCB上的导线（如PCIe金手指） | 内核中的数据结构（`struct bus_type`） |
+| **作用**     | 传输电信号/数据             | 管理设备与驱动的匹配规则              |
+| **示例**     | USB数据线、I2C时钟线        | `platform_bus_type`、`pci_bus_type`   |
+
+> **Linux内核中总线的四大核心职责**
+
+![deepseek_mermaid_20250702_993b66](C:\Users\w50050217\Downloads\deepseek_mermaid_20250702_993b66.png)
+
+- **设备发现**：枚举连接到总线的设备（如PCI配置空间读取）
+- **驱动匹配**：通过`match()`函数关联设备与驱动
+- **生命周期管理**：处理设备的插拔、休眠唤醒
+- **抽象隔离**：对上层隐藏不同硬件的差异
+
+> **典型总线类型的内核实现**
+
+1. ##### **Platform总线（虚拟总线）**
+
+   ```c
+   struct bus_type platform_bus_type = {
+       .name = "platform",
+       .match = platform_match, // 匹配逻辑：比较name或设备树compatible
+   };
+   ```
+
+   - **适用场景**：片上系统(SOC)中的非标准外设（如GPIO控制器）
+
+2. ##### **PCI总线**
+
+   ```c
+   struct bus_type pci_bus_type = {
+       .name = "pci",
+       .match = pci_bus_match, // 匹配逻辑：比较Vendor/Device ID
+       .uevent = pci_uevent,   // 热插拔事件处理
+   };
+   ```
+
+3. ##### **I2C总线**
+
+   ```c
+   struct bus_type i2c_bus_type = {
+       .name = "i2c",
+       .match = i2c_device_match, // 匹配逻辑：设备树或固定ID
+   };
+   ```
+
+4. **总线如何关联物理线路**
+
+   ![deepseek_mermaid_20250702_1e978b](C:\Users\w50050217\Downloads\deepseek_mermaid_20250702_1e978b.png)
+
+   - **硬件层**：PHY芯片处理电气信号
+   - **总线层**：内核维护设备列表和驱动列表
+   - **驱动层**：通过总线提供的API访问硬件
 
