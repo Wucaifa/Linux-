@@ -903,4 +903,666 @@ ACPI（Advanced Configuration and Power Interface，高级配置与电源接口�
 - **硬件加速器直连**：
   如摄像头数据通过**专用DMA通道**直达ISP，不经过CPU。
 
-  
+## ftrace、tracepoint、trace_event机制
+
+https://www.cnblogs.com/wsg1100/p/17020703.html
+
+```mermaid
+flowchart TD
+    %% 定义节点样式
+    classDef event fill:#d4f1f9,stroke:#3a5f7d,stroke-width:2px,rounded:5px
+    classDef point fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,rounded:5px
+    classDef ftrace fill:#fce4ec,stroke:#c2185b,stroke-width:2px,rounded:5px
+    classDef tool fill:#fff3e0,stroke:#fb8c00,stroke-width:2px,rounded:5px
+
+    %% 核心组件
+    A[trace_event\n用户态友好接口]:::event
+    B[tracepoint\n静态内核埋点]:::point
+    C[ftrace\n底层追踪引擎]:::ftrace
+
+    %% 工具链
+    D[perf/trace-cmd]:::tool
+    E[kernelshark]:::tool
+
+    %% 层级关系
+    A -->|基于| B
+    B -->|依赖| C
+
+    %% 用户态工具连接
+    D -.->|读取| A
+    E -.->|可视化| A
+
+    %% 图例说明
+    legend[("层级关系说明")]
+    style legend fill:#ffffff,stroke:#ddd,stroke-width:1px
+```
+
+
+
+
+
+## 知识点补充
+
+### 1.DDR负载
+
+DDR负载衡量的是内存控制器和内存颗粒在单位时间内处理数据请求的繁忙程度，主要包括：
+
+- **带宽占用率**：实际数据传输量占理论最大带宽的比例。
+- **访问频率**：读写操作的密集程度（如每秒操作次数）。
+- **队列深度**：等待处理的内存请求数量。
+
+> **关键指标与测量方式**
+
+1. **带宽利用率（Bandwidth Utilization）**
+
+   - **公式**：
+     $$
+     利用率=\frac{实际传输数据量 (GB/s)}{理论带宽 (GB/s)}×100%
+     $$
+
+     - **理论带宽计算**：
+       DDR4-3200（单通道）：3200MT/s×64bit/8≈25.6GB/s3200MT/s×64bit/8≈25.6GB/s
+       （双通道翻倍为51.2 GB/s）
+
+   - **工具**：
+
+     - Linux: `sar -r`, `perf stat`, `vtune`
+     - Windows: Task Manager（内存性能选项卡）、AIDA64。
+
+2. **读写比例（Read/Write Ratio）**
+
+   - 负载特性取决于读写操作占比：
+     - **读密集型**（如数据库查询） vs **写密集型**（如视频渲染）。
+   - 通过内存性能工具（如`perf mem`）统计读写操作次数。
+
+3. **延迟（Latency）**
+
+   - **高负载表现**：访问延迟增加（因队列竞争或Bank冲突）。
+   - **测量工具**：
+     - `lmbench`（内存延迟测试）
+     - Intel MLC（Memory Latency Checker）。
+
+4. **占用率（Occupancy）**
+
+   - **内存控制器占用率**：处理指令队列的时间占比（如通过PMU性能计数器获取）。
+   - **Bank-Level并行度**：DDR内存的Bank冲突会降低效率。
+
+### 2.pm_qos
+
+**PM_QoS**（Power Management Quality of Service，电源管理服务质量）是 **Linux 内核** 中的一个机制，用于**协调不同组件对系统电源管理（如 CPU 频率、设备低功耗状态）的需求**，确保系统在满足性能要求的同时尽可能节省功耗。
+
+> **1. PM_QoS 的作用**
+
+在 Linux 系统中，多个进程或设备可能对电源管理有不同的需求：
+
+- **性能优先**（如游戏、视频播放）希望 CPU 保持高频运行。
+- **节能优先**（如后台服务）希望 CPU 进入低功耗状态。
+
+PM_QoS 的作用是：
+
+- **收集** 不同组件（CPU、GPU、设备驱动等）的电源管理需求（QoS 请求）。
+- **仲裁** 这些需求，决定最终的电源管理策略（如 CPU 频率、设备是否进入休眠）。
+- **通知** 相关子系统（如 CPUFreq、DevFreq）调整电源状态。
+
+> **2. PM_QoS 的主要应用场景**
+
+**(1) CPU 频率管理（CPUFreq）**
+
+- 某些任务（如音视频播放）要求 CPU 保持最低频率（`min_freq`），避免卡顿。
+- PM_QoS 可以设置 `cpu_dma_latency` 或 `min_frequency` 约束，防止 CPU 降频过低。
+
+**(2) 设备电源管理（Runtime PM）**
+
+- 某些外设（如网卡、SSD）在数据传输时不能被挂起（suspend）。
+- PM_QoS 可以设置 `DEVICE_PM_QOS_RESUME_LATENCY`（恢复延迟约束），确保设备能快速唤醒。
+
+**(3) 实时性要求（如音频）**
+
+- 音频播放需要低延迟，避免 CPU 进入深度休眠（如 `C-states`）。
+- PM_QoS 可以设置 `latency_tolerance`，限制 CPU 进入高延迟省电模式。
+
+| 特性            | 说明                                                   |
+| :-------------- | :----------------------------------------------------- |
+| **PM_QoS 作用** | 协调不同组件对电源管理的需求（性能 vs 功耗）           |
+| **典型应用**    | CPU 频率管理、设备电源管理、低延迟任务                 |
+| **用户接口**    | `/sys/devices/virtual/power/pm_qos/`                   |
+| **内核 API**    | `pm_qos_add_request()`, `pm_qos_update_request()`      |
+| **常见约束**    | `cpu_dma_latency`, `resume_latency`, `network_latency` |
+
+### 3.platform
+
+Platform 机制是 Linux 内核中用于管理 **嵌入式/SOC（系统级芯片）硬件平台** 的核心框架，它提供了一种标准化的方式来描述和操作与平台相关的硬件设备（如时钟控制器、中断控制器、GPIO、DMA 等非外设类硬件资源）。
+
+平台设备模型是对device和driver模型的扩展。
+
+> 解决什么问题？
+
+在嵌入式系统中，许多硬件设备是直接集成在 SOC 内部的（例如 UART、I2C 控制器、电源管理单元等），它们：
+
+- **不是标准外设**（如 USB、PCIe 设备），无法通过总线枚举（Bus Scanning）自动发现。
+- **依赖 SOC 特定配置**（如寄存器地址、中断号）。
+
+Platform 机制通过 **设备-驱动匹配模型** 和 **硬件资源抽象**，统一管理这些设备。
+
+> 核心功能
+
+1. **设备抽象**
+   将 SOC 内置硬件抽象为 `platform_device`。
+2. **驱动匹配**
+   通过 `platform_driver` 绑定设备与驱动。
+3. **资源管理**
+   统一处理内存映射、中断、DMA 通道等资源。
+4. **电源管理**
+   支持 `suspend/resume` 等低功耗操作。
+
+> 关键数据结构
+
+1. **platform_device（平台设备）**
+
+   描述一个具体的硬件设备，通常在 **设备树（Device Tree）** 或 **ACPI** 中定义，内核启动时注册：
+
+   ```c
+   struct platform_device {
+       const char *name;       // 设备名称（匹配驱动的关键）
+       int id;                 // 实例ID（同名设备区分用）
+       struct device dev;      // 基础设备结构
+       struct resource *resource; // 硬件资源数组
+       unsigned int num_resources; // 资源数量
+       // ...
+   };
+   ```
+
+   **`resource`** 描述设备的硬件资源，例如：
+
+   ```c
+   struct resource {
+       resource_size_t start; // 起始地址（物理地址或IRQ号）
+       resource_size_t end;   // 结束地址
+       unsigned long flags;  // 资源类型（IORESOURCE_MEM/IORESOURCE_IRQ）
+   };
+   ```
+
+2. **platform_driver（平台驱动）**
+
+   驱动开发者实现的设备操作逻辑：
+
+   ```c
+   struct platform_driver {
+       int (*probe)(struct platform_device *); // 设备初始化
+       int (*remove)(struct platform_device *); // 设备卸载
+       void (*shutdown)(struct platform_device *); // 关机回调
+       int (*suspend)(struct platform_device *, pm_message_t); // 低功耗
+       int (*resume)(struct platform_device *);
+       struct device_driver driver; // 驱动元数据（含.of_match_table匹配表）
+   };
+   ```
+
+> 工作流程
+
+1. **设备注册**
+
+   - **设备树（Device Tree）方式**（ARM/LoongArch/RISC-V 常用）：
+
+     ```ini
+     // 定义UART设备
+     uart0: serial@10000000 {
+         compatible = "vendor,soc-uart";
+         reg = <0x10000000 0x1000>;
+         interrupts = <10>;
+     };
+     ```
+
+     内核解析设备树后，自动生成对应的 `platform_device`。
+
+   - **硬编码方式**（传统，已逐渐淘汰）：
+
+     ```c
+     static struct resource uart_resources[] = {
+         [0] = { .start = 0x10000000, .end = 0x10000FFF, .flags = IORESOURCE_MEM },
+         [1] = { .start = 10, .end = 10, .flags = IORESOURCE_IRQ },
+     };
+     
+     static struct platform_device uart_device = {
+         .name = "soc-uart",
+         .id = 0,
+         .num_resources = ARRAY_SIZE(uart_resources),
+         .resource = uart_resources,
+     };
+     
+     platform_device_register(&uart_device); // 手动注册
+     ```
+
+2. **驱动注册与匹配**
+
+   驱动通过 `platform_driver_register()` 注册，并通过以下方式匹配设备：
+
+   - **名称匹配**：`platform_device.name` == `platform_driver.driver.name`。
+
+   - **设备树匹配**：`compatible` 字符串匹配 `platform_driver.driver.of_match_table`。
+
+     ```c
+     static const struct of_device_id uart_dt_ids[] = {
+         { .compatible = "vendor,soc-uart" },
+         {}
+     };
+     
+     static struct platform_driver uart_driver = {
+         .driver = {
+             .name = "soc-uart",
+             .of_match_table = uart_dt_ids,
+         },
+         .probe = uart_probe,
+         .remove = uart_remove,
+     };
+     
+     module_platform_driver(uart_driver); // 注册驱动
+     ```
+
+3. **设备初始化（probe）**
+
+   匹配成功后，内核调用驱动的 `probe()` 函数：
+
+   ```c
+   static int uart_probe(struct platform_device *pdev) {
+       struct resource *mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+       void __iomem *base = ioremap(mem->start, resource_size(mem));
+       
+       int irq = platform_get_irq(pdev, 0);
+       request_irq(irq, uart_interrupt, IRQF_SHARED, "uart0", NULL);
+       
+       // 初始化硬件寄存器...
+       return 0;
+   }
+   ```
+
+### 4.NSV
+
+在芯片设计（尤其是 **SoC/多核处理器**）中，**NSV（NoC Supply Voltage）** 是指 **片上网络（Network-on-Chip, NoC）的供电电压**。NoC 是现代复杂 SoC 中用于连接多个计算单元（如 CPU、GPU、DSP、内存控制器等）的通信基础设施，而 NSV 直接影响 NoC 的性能、功耗和稳定性。
+
+> **NoC（片上网络）的作用**
+
+NoC 是 SoC 内部的“高速公路”，负责：
+
+- **模块间通信**：如 CPU 与 GPU 的数据交换。
+- **资源共享**：管理内存带宽、中断信号等。
+- **功耗与性能平衡**：通过动态调整电压/频率（DVFS）优化能效。
+
+> **NSV 的核心概念**
+
+**(1) 什么是 NSV？**
+
+- **NSV** 是 NoC 的供电电压（单位通常为毫伏，mV）。
+- 与 **时钟频率** 共同决定 NoC 的通信性能：
+  - **高电压 + 高频率**：高吞吐量，但功耗大。
+  - **低电压 + 低频率**：节能，但可能限制带宽。
+
+**(2) 为什么需要管理 NSV？**
+
+- **功耗优化**：NoC 可能占 SoC 总功耗的 20%~30%，需动态调节电压。
+- **性能需求**：高负载时需升压保障延迟敏感任务（如 GPU 渲染）。
+- **可靠性**：电压不足可能导致信号完整性（SI）问题。
+
+### 5.DDR DFS
+
+**DFS（Dynamic Frequency Scaling，动态频率调节）**
+
+### 6.投票节点
+
+| **术语**     | **全称/解释**                                             | **功能说明**                                                 |
+| :----------- | :-------------------------------------------------------- | :----------------------------------------------------------- |
+| **AP**       | **Application Processor（应用处理器）**                   | 主处理器，负责运行操作系统（如Android/Linux）和应用程序，集成CPU/GPU/NPU等核心模块。 |
+| **HIFI**     | **High-Fidelity Audio Processor（高保真音频处理器）**     | 专用音频DSP，处理高解析度音频编解码（如LDAC、aptX HD），降低主AP负载。 |
+| **LPMCU**    | **Low Power Microcontroller Unit（低功耗微控制器）**      | 独立低功耗协处理器，管理传感器、待机状态等任务（如苹果的Always-On Display控制）。 |
+| **IOMCU**    | **Input/Output Microcontroller Unit（输入输出微控制器）** | 负责外设接口（如USB、GPIO）的实时控制，减少AP唤醒频率。      |
+| **LIT_LAT**  | **Little Core Low Latency Mode（小核低延迟模式）**        | ARM小核（如Cortex-A510）的高响应模式，用于实时轻量级任务（如中断处理）。 |
+| **BIG_LAT**  | **Big Core Low Latency Mode（大核低延迟模式）**           | ARM大核（如Cortex-X4）的快速响应状态，用于突发高性能需求（如游戏帧生成）。 |
+| **MID_LAT**  | **Middle Core Low Latency Mode（中核低延迟模式）**        | 中核（如Cortex-A720）的平衡模式，兼顾能效和响应速度（如后台服务）。 |
+| **LATSTAT**  | **Latency Status（延迟状态寄存器）**                      | 实时记录各核心的延迟数据（单位：ns），供调度器优化任务分配。 |
+| **MODEM**    | **基带处理器**                                            | 独立或集成于SoC的通信模块，处理蜂窝网络（5G/4G）、射频信号等，与AP通过共享内存或HSI总线交互。 |
+| **CPU_XPU**  | **CPU Accelerator Unit（CPU加速单元）**                   | 专用计算单元（如Intel AMX、ARM SVE2），加速AI/矩阵运算，卸载CPU负载。 |
+| **GPU_XPU**  | **GPU Accelerator Unit（GPU加速单元）**                   | GPU的通用计算模块（如OpenCL/Vulkan），用于并行计算（图像处理、科学计算）。 |
+| **RESERVED** | **保留字段**                                              | 预留给未来扩展功能（如新型硬件加速器）。                     |
+| **AP_HOST**  | **AP Host Controller（AP主控制器）**                      | 管理AP的电源状态、时钟域和总线仲裁（如ARM的CCI-700互连）。   |
+| **DSS**      | **Display Subsystem（显示子系统）**                       | 集成显示控制器（DPU）、MIPI DSI接口等，驱动屏幕并处理HDR/刷新率自适应。 |
+
+### 7.QICE
+
+**QICE（Quality of Service, Intelligence, Computing Efficiency）**， 是一种面向智能计算场景的 **多维优化框架**，融合了 **服务质量（QoS）、智能调度（AI）和计算效率（Efficiency）**，旨在平衡实时性、资源利用率和能耗。其核心思想是通过 **动态策略** 和 **硬件-软件协同**，在复杂负载下实现最优的系统性能。
+
+> **QICE 的三大核心维度**
+
+| **维度**                             | **目标**                                           | **关键技术**                                                 |
+| :----------------------------------- | :------------------------------------------------- | :----------------------------------------------------------- |
+| **QoS（服务质量）**                  | 保障高优先级任务的实时性（如自动驾驶、工业控制）。 | - 优先级调度（SCHED_DEADLINE） - 资源隔离（cgroups, CPU/GPU 分区） |
+| **Intelligence（智能）**             | 利用 AI 预测负载并动态调整资源分配。               | - 强化学习（RL） - 负载预测模型（LSTM/Transformer）          |
+| **Computing Efficiency（计算能效）** | 最大化每瓦特算力（TOPS/W），降低功耗。             | - 动态电压频率调整（DVFS） - 异构计算（CPU+GPU+NPU 协同）    |
+
+### 8.**EXMBIST**
+
+**EXMBIST（Extended Memory Built-In Self-Test，扩展内存内建自测试）** 是一种高级内存测试技术，用于在芯片制造、系统启动或运行时 **自动检测和诊断内存（如SRAM、DRAM、eMRAM等）的物理缺陷和软错误**。它通过硬件集成的测试引擎执行预定义或可编程的测试算法，无需外部测试设备，显著提升测试覆盖率和可靠性。
+
+### 9.**DMC**
+
+**DMC（Dynamic Memory Controller，动态内存控制器）** 是 SoC（系统级芯片）中的关键模块，负责 **管理与协调 CPU 及其他主设备（如 GPU、DMA）对动态内存（DRAM/DDR）的访问**，直接影响系统性能、能效和稳定性。其核心功能包括地址映射、时序控制、带宽优化及低功耗管理。
+
+```ini
++-------------------+       +-------------------+
+| CPU/GPU/DMA Master | <---> |   DMC 控制器      |
++-------------------+       +-------------------+
+                                |  |  |
+                                v  v  v
+                        +-------------------+
+                        |   DRAM 物理层     |
+                        | （PHY，如 DDR PHY）|
+                        +-------------------+
+                                |
+                                v
+                          +-----------+
+                          | DRAM 芯片 |
+                          | （DDR4/5）|
+                          +-----------+
+```
+
+- **仲裁器（Arbiter）**：
+  处理多个主设备的并发请求，基于优先级或轮询策略分配带宽。
+- **命令队列（Command Queue）**：
+  重新排序读写命令以最大化总线利用率（如优先激活已打开的 Bank）。
+- **PHY 接口**：
+  负责电气信号转换（数字→模拟），满足 DDR 严格的时序要求。
+
+### 10.HW和IPC
+
+在芯片设计中，**HW（Hardware，硬件）架构** 和 **IPC（Instructions Per Cycle，每时钟周期指令数）** 是决定处理器性能的两大核心要素。
+
+### 11.DDR频率与带宽的关系
+
+带宽：**每秒可以传输的数据量**。
+
+- Nanchang LP6：
+- bandwidth = (freq * 24 * 4 * 2 * 60%) / 8 * 256 / 288
+
+| **因子**     | **物理意义**                                                | **计算示例（freq=3200MHz）** |
+| :----------- | :---------------------------------------------------------- | :--------------------------- |
+| **freq**     | 内存基础频率（单位：MHz）                                   | 3200 MHz                     |
+| **×24**      | 每通道数据总线位数（LP6的24-bit宽总线设计）                 | 3200×24 = 76,800             |
+| **×4**       | 四通道配置（LP6常见多通道架构）                             | 76,800×4 = 307,200           |
+| **×2**       | DDR双倍数据率（上升沿+下降沿传输）                          | 307,200×2 = 614,400          |
+| **×60%**     | 实际效率因子（考虑命令开销、刷新损失等）                    | 614,400×0.6 = 368,640        |
+| **÷8**       | 比特转字节（1Byte=8bit）                                    | 368,640÷8 = 46,080           |
+| **×256/288** | 编码效率调整（LP6的256B有效数据/288B物理传输，含ECC和校验） | 46,080×(256/288) ≈ 40,960    |
+| **最终结果** | 理论有效带宽（单位：MB/s）                                  | **40,960 MB/s (≈41 GB/s)**   |
+
+### 12.QOS类型
+
+| **QoS 类型**              | **说明**                            | **对 CPU 频率的影响**       |
+| :------------------------ | :---------------------------------- | :-------------------------- |
+| `PM_QOS_CPU_DMA_LATENCY`  | 限制 DMA 延迟（如音频、低延迟设备） | 提高 CPU 最小频率，减少延迟 |
+| `PM_QOS_NETWORK_LATENCY`  | 网络低延迟需求（如实时通信）        | 可能提高 CPU 频率以降低延迟 |
+| `PM_QOS_CPU_THROUGHPUT`   | 要求高计算吞吐量（如视频编码）      | 提高 CPU 最大频率           |
+| `PM_QOS_MEMORY_BANDWIDTH` | 内存带宽需求（如 GPU 计算）         | 可能影响 CPU 缓存和频率     |
+
+### 13.设备树
+
+设备树（**Device Tree**，简称 **DT**）是 Linux 内核用于描述硬件的一种数据结构，主要用于 **嵌入式系统**（如 ARM、RISC-V、PowerPC 等），使得内核可以 **动态识别硬件**，而无需硬编码硬件信息。
+
+> 设备树的作用
+
+在传统的嵌入式 Linux 系统中，硬件信息通常直接写在内核代码里（如 `arch/arm/mach-xxx`）。这种方式会导致：
+
+- **内核臃肿**：每种板子都需要单独的内核配置。
+- **维护困难**：硬件改动需要重新编译内核。
+
+**设备树的引入解决了这些问题**：
+
+1. **硬件描述与内核分离**：设备树文件（`.dts`）描述硬件，内核只需解析设备树。
+2. **支持多种硬件**：同一内核可适配不同开发板，只需更换设备树文件。
+3. **动态加载**：Bootloader（如 U-Boot）在启动时传递设备树给内核。
+
+> 核心概念
+
+1. **设备树文件类型**
+
+   | 文件类型    | 说明                                                  |
+   | :---------- | :---------------------------------------------------- |
+   | **`.dts`**  | 设备树源文件（可读的文本文件）                        |
+   | **`.dtsi`** | 设备树包含文件（类似头文件，可被多个 `.dts` 引用）    |
+   | **`.dtb`**  | 编译后的二进制设备树（由 `dtc` 编译生成，供内核使用） |
+
+2. **设备树基本结构**
+
+   ```dts
+   /dts-v1/;                          // 设备树版本
+   / {                                // 根节点
+       compatible = "vendor,board";   // 板子兼容性标识
+       model = "My Board";            // 板子名称
+   
+       cpus {                         // CPU 节点
+           cpu@0 {
+               compatible = "arm,cortex-a53";
+               device_type = "cpu";
+               reg = <0x0>;
+           };
+       };
+   
+       memory@80000000 {              // 内存节点
+           device_type = "memory";
+           reg = <0x80000000 0x40000000>; // 起始地址 0x80000000，大小 1GB
+       };
+   
+       uart0: serial@12340000 {       // UART 设备节点
+           compatible = "ns16550a";
+           reg = <0x12340000 0x1000>;
+           interrupts = <0 45 4>;
+       };
+   };
+   ```
+
+   - **`/`**：根节点，所有设备都是它的子节点。
+   - **`compatible`**：用于匹配驱动（如 `"ns16550a"` 匹配串口驱动）。
+   - **`reg`**：寄存器地址范围（`<起始地址 长度>`）。
+   - **`interrupts`**：中断号（`<中断控制器, 中断号, 触发方式>`）。
+   - **`device_type`**：设备类型（如 `"cpu"`, `"memory"`）。
+
+> 设备树与驱动交互
+
+1. **驱动匹配设备**
+
+   内核驱动通过 `compatible` 属性匹配设备：
+
+   ```c
+   static const struct of_device_id my_driver_match[] = {
+       { .compatible = "vendor,my-device" }, // 匹配设备树中的 compatible
+       {},
+   };
+   MODULE_DEVICE_TABLE(of, my_driver_match);
+   
+   static struct platform_driver my_driver = {
+       .probe = my_probe_function,
+       .driver = {
+           .name = "my-device",
+           .of_match_table = my_driver_match, // 指定匹配表
+       },
+   };
+   ```
+
+   - 如果设备树中有 `compatible = "vendor,my-device"`，内核会自动调用 `my_probe_function`。
+
+2. **从设备树读取数据**
+
+   ```c
+   // 获取设备树节点
+   struct device_node *np = pdev->dev.of_node;
+   
+   // 读取寄存器地址
+   u32 reg_addr;
+   of_property_read_u32(np, "reg", &reg_addr);
+   
+   // 获取中断号
+   int irq = irq_of_parse_and_map(np, 0);
+   ```
+
+> **设备树编译与加载**
+
+1. **编译设备树**
+
+   ```bash
+   dtc -I dts -O dtb -o my_board.dtb my_board.dts  # 编译 .dts -> .dtb
+   ```
+
+   - `dtc`：设备树编译器（Device Tree Compiler）。
+
+2. **U-Boot 加载设备树**
+
+   ```bash
+   # 在 U-Boot 命令行加载设备树
+   load mmc 0:1 ${fdt_addr} my_board.dtb
+   bootz ${kernel_addr} - ${fdt_addr}  # 启动内核并传递设备树
+   ```
+
+3. **内核查看设备树**
+
+   ```bash
+   # 查看内核解析的设备树
+   ls /proc/device-tree/
+   
+   # 查看某个设备树节点
+   cat /proc/device-tree/soc/uart@12340000/compatible
+   ```
+
+> 设备树用法
+
+1. **设备树覆盖（Overlay）**
+
+   适用于动态修改设备树（如插入外设）：
+
+   ```bash
+   # 加载 overlay
+   fdtoverlay -i base.dtb -o new.dtb overlay.dtbo
+   ```
+
+2. **设备树绑定（Bindings）**
+
+   设备树绑定文档（`Documentation/devicetree/bindings/`）定义了标准设备的 `compatible` 和属性。
+
+3. **设备树调试**
+
+   ```bash
+   # 检查设备树语法
+   dtc -I dtb -O dts my_board.dtb -o my_board.dts  # 反编译 .dtb -> .dts
+   
+   # 内核启动时打印设备树解析信息
+   bootargs="earlycon console=ttyS0,115200 debug"
+   ```
+
+
+
+### 14.sysfs接口
+
+sysfs 是 Linux 内核提供的一个虚拟文件系统，它可以将内核对象、属性和它们之间的关系导出到用户空间。允许用户空间的程序或管理员通过文件系统接口（读/写文件）来查看和修改内核或驱动的参数。
+
+> 实现方式
+
+1. 在内核模块中创建 `kobject`
+2. 通过 `sysfs_create_file()` 或类似函数添加属性文件
+3. 实现 show() 和 store() 方法来处理读写操作
+
+### 15. **`container_of` 宏**
+
+`container_of` 是 Linux 内核中一个非常常用的宏，定义在 `include/linux/kernel.h` 中，其作用是：
+
+- **给定一个结构体成员的地址**，通过计算该成员在结构体中的偏移量，**返回整个结构体的地址**。
+
+### 16.devfreq-event 设备与 devfreq 设备的关系
+
+- `devfreq-event`：负责**监测**设备活动/负载（提供原始性能事件数据）
+- `devfreq`：负责**决策和执行**频率调节（根据监测数据调整设备频率）
+
+```ini
+devfreq-event设备 → 采集监测数据 → devfreq驱动 → 调整设备频率/电压
+```
+
+### 17.**`EXPORT_SYMBOL_GPL`**
+
+- **`devfreq_core.ko`**（核心模块）定义了 `devfreq_event_enable_edev()`。
+- **`devfreq_simple_ondemand.ko`**（策略模块）需要使用这个函数来启用事件设备。
+- 如果没有 `EXPORT_SYMBOL_GPL`，`simple_ondemand` 模块就无法调用该函数，导致链接失败。
+
+| 导出宏                | 允许调用的模块           | 典型用途                         |
+| :-------------------- | :----------------------- | :------------------------------- |
+| `EXPORT_SYMBOL()`     | 任何模块（包括专有驱动） | 通用 API，如 `kmalloc`、`printk` |
+| `EXPORT_SYMBOL_GPL()` | 仅限 GPL 兼容模块        | 内核核心功能，如调度器、PM QoS   |
+
+```c
+// 正确：GPL 模块可调用
+MODULE_LICENSE("GPL");
+...
+ret = devfreq_event_enable_edev(edev);
+
+// 错误：非 GPL 模块会加载失败
+MODULE_LICENSE("Proprietary");
+...
+ret = devfreq_event_enable_edev(edev); // 编译通过，但 insmod 时报错
+```
+
+
+
+### 18.`module()`机制
+
+> **模块声明宏（最常见）**
+
+```c
+module_init(xxx_init);   // 指定模块加载时执行的函数
+module_exit(xxx_exit);   // 指定模块卸载时执行的函数
+```
+
+**作用**：
+定义内核模块的入口和出口函数，是每个Linux内核模块必备的声明。
+
+```c
+#include <linux/module.h>
+
+static int __init mymodule_init(void) {
+    printk(KERN_INFO "Module loaded\n");
+    return 0;
+}
+
+static void __exit mymodule_exit(void) {
+    printk(KERN_INFO "Module unloaded\n");
+}
+
+module_init(mymodule_init);
+module_exit(mymodule_exit);
+MODULE_LICENSE("GPL");
+```
+
+**关键点**：
+
+- `__init` 和 `__exit` 是段标记，用于优化内存使用
+- `MODULE_LICENSE()` 必须声明许可证（如GPL）
+
+> **模块参数传递（如果指 module_param）**
+
+```c
+module_param(name, type, perm);
+```
+
+**作用**：
+允许在加载模块时传递参数，如：
+
+```bash
+insmod mymodule.ko param_name=value
+
+static int debug_level = 0;
+module_param(debug_level, int, 0644);
+MODULE_PARM_DESC(debug_level, "Debug message level (0-3)");
+```
+
+> **模块信息声明**
+
+```c
+MODULE_AUTHOR("Your Name");          // 作者信息
+MODULE_DESCRIPTION("Module func");   // 模块描述
+MODULE_VERSION("1.0.0");            // 版本号
+```
+
+
